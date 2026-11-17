@@ -1,0 +1,54 @@
+[project]
+name = "fastapipythonbackend"
+version = "0.1.0"
+requires-python = ">=3.14"
+dependencies = [
+    "anthropic>=2.10.0",
+    "daytona>=0.232.0",
+    "fastapi[standard]>=0.163.1",
+    "firebase-admin>=7.8.0",
+    "google-cloud-firestore>=2.34.1",
+    "limits[redis]>=5.8.0",
+    "pydantic-settings>=2.16.3",
+    "stripe>=17.0.0",
+    "uvicorn>=0.54.0",
+]
+
+[dependency-groups]
+dev = [
+    "fakeredis[lua]>=2.40.0",
+    "pyright>=1.1.414",
+    "ruff>=0.17.5",
+]
+
+[tool.ruff]
+target-version = "py314"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I"]
+
+[tool.pyright]
+pythonVersion = "3.14"
+typeCheckingMode = "basic"
+include = [
+    "auth.py",
+    "billing.py",
+    "authorization.py",
+    "authorization_models.py",
+    "config.py",
+    "database.py",
+    "firestore_access.py",
+    "health.py",
+    "main.py",
+    "observability.py",
+    "projects.py",
+    "project_sessions.py",
+    "rate_limits.py",
+    "request_limits.py",
+    "serve.py",
+    "scripts",
+    "workspace_runs.py",
+    "workspace_dispatch.py",
+]
+exclude = [".venv"]

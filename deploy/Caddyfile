@@ -1,0 +1,26 @@
+{
+    servers {
+        timeouts {
+            read_header {$REQUEST_TIMEOUT_SECONDS}s
+            read_body {$REQUEST_TIMEOUT_SECONDS}s
+        }
+    }
+}
+
+{$API_DOMAIN} {
+    request_body {
+        max_size {$REQUEST_MAX_BODY_BYTES}
+    }
+
+    # Health probes are for the private API listener, not public clients.
+    @health path /health /health/*
+    respond @health 404
+
+    reverse_proxy {$API_UPSTREAM} {
+        # Caddy's default behaviour sets forwarded headers from the real peer
+        # and ignores untrusted incoming forwarded values. Do not trust all peers.
+        transport http {
+            response_header_timeout {$CADDY_UPSTREAM_TIMEOUT_SECONDS}s
+        }
+    }
+}
