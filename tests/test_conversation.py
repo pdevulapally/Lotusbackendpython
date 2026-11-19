@@ -4,6 +4,7 @@ from unittest.mock import Mock, patch
 from uuid import uuid4
 
 from fastapi.testclient import TestClient
+from google.api_core.exceptions import Aborted, ServiceUnavailable
 
 from conversation import READY, Reply
 from tests.helpers import ServiceTestCase, make_settings
@@ -47,13 +48,11 @@ class ConversationTests(ServiceTestCase):
 
     def tick(self, admitted=True):
         # Construct a fresh dispatcher on each step: only the store survives restarts.
-        return Dispatcher(
-            self.app_,
-            self.config,
-            self.tools,
-            self.legacy_model,
-            admitted_conversation_model=self.model if admitted else None,
-        ).tick()
+        worker = Dispatcher(self.app_, self.config, self.tools, self.legacy_model)
+        if not admitted:
+            return worker.tick()
+        with patch("workspace_dispatch.admitted_conversation_model", return_value=self.model):
+            return worker.tick()
 
     def result(self, kind, text):
         return SimpleNamespace(
@@ -147,6 +146,9 @@ class ConversationTests(ServiceTestCase):
         )
         self.assertFalse(self.tick())
 
+        # Both synthetic completions were observed, but neither stale answer was published.
+        self.assertEqual(self.store.documents[self.path]["usage"], [{"output_tokens": 1}] * 2)
+
     def test_no_workspace_even_with_existing_binding_and_no_paid_fallback(self):
         self.store.change(
             slot_path(self.settings, self.project),
@@ -156,6 +158,107 @@ class ConversationTests(ServiceTestCase):
         self.tick(admitted=False)
         self.assertEqual(self.client.get(self.url).json()["status"], "blocked_budget")
         self.model.messages.parse.assert_not_called()
+        self.assertEqual(self.store.documents[self.path]["usage"], [])
+
+    def test_expired_worker_cannot_publish_even_before_takeover(self):
+        self.ask().raise_for_status()
+
+        def expired(**_):
+            self.store.documents[self.path]["available"] = 0
+            return self.result("answer", "expired result")
+
+        self.model.messages.parse.side_effect = expired
+        self.tick()
+        self.assertEqual(self.client.get(self.url).json()["cursor"], 1)
+        self.tick()
+        final = self.client.get(self.url).json()
+        self.assertEqual([e["kind"] for e in final["events"]], ["question", "uncertain"])
+        self.assertFalse(self.tick())
+        self.model.messages.parse.assert_called_once()
+
+    def test_competing_claim_transactions_publish_once(self):
+        self.ask().raise_for_status()
+        self.model.messages.parse.return_value = self.result("answer", "only answer")
+        self.store.before_commit = self.tick
+        with self.assertRaises(Aborted):
+            self.tick()
+        self.assertFalse(self.tick())
+        self.model.messages.parse.assert_called_once()
+        self.assertEqual(self.client.get(self.url).json()["cursor"], 2)
+        self.assertEqual(self.store.documents[self.path]["usage"], [{"output_tokens": 1}])
+
+    def test_model_timeout_never_repeats_an_uncertain_call(self):
+        self.ask().raise_for_status()
+        self.model.messages.parse.side_effect = TimeoutError()
+        self.tick()
+        self.assertFalse(self.tick())
+        state = self.ask().json()
+        self.assertEqual([e["kind"] for e in state["events"]], ["question", "uncertain"])
+        self.assertFalse(self.tick())
+        self.model.messages.parse.assert_called_once()
+
+    def test_lost_mutation_acknowledgements_recover_committed_effects(self):
+        run = self.store.run
+
+        def lose_ack(operation):
+            version = self.store.version
+            result = run(operation)
+            if version != self.store.version:
+                raise ServiceUnavailable("simulated lost commit acknowledgement")
+            return result
+
+        self.body["operation_id"] = str(uuid4())
+        first = self.url + "/messages/" + str(uuid4())
+        second = self.url + "/messages/" + str(uuid4())
+        with patch.object(self.store, "run", side_effect=lose_ack):
+            for send in (
+                self.create,
+                self.ask,
+                lambda: self.client.put(first, json={"question": "Same text"}),
+                lambda: self.client.put(second, json={"question": "Same text"}),
+                lambda: self.client.put(self.url + "/stop"),
+            ):
+                self.assertEqual(send().status_code, 503)
+                send().raise_for_status()
+        self.assertEqual(len(self.client.get(self.base).json()["projects"]), 2)
+        self.assertEqual(
+            [e["kind"] for e in self.client.get(self.url).json()["events"]],
+            ["question", "correction", "correction", "stop_requested", "stopped"],
+        )
+
+    def test_session_id_from_another_owned_project_cannot_resolve_or_mutate_run(self):
+        self.ask().raise_for_status()
+        self.body["operation_id"] = str(uuid4())
+        other = self.create().json()["id"]
+        wrong = self.url.replace(self.project, other)
+        before = deepcopy(self.store.documents)
+        for response in (
+            self.client.get(wrong),
+            self.client.put(wrong + "/stop"),
+            self.client.put(wrong + "/messages/" + str(uuid4()), json={"question": "Change"}),
+        ):
+            self.assertEqual(response.status_code, 404)
+        self.assertEqual(self.store.documents, before)
+
+    def test_session_write_permission_revoked_during_execution(self):
+        self.ask().raise_for_status()
+
+        def revoke(**_):
+            permissions = self.store.documents[
+                self.settings.authorization_collections.policies,
+                self.settings.authorization_policy_id,
+            ]["resources"][self.settings.project_resource_kind]["update_permissions"]
+            permissions.remove(self.settings.project_session_write_permission)
+            denied = self.client.put(
+                self.url + "/messages/" + str(uuid4()), json={"question": "late"}
+            )
+            self.assertEqual(denied.status_code, 404)
+            return self.result("answer", "revoked")
+
+        self.model.messages.parse.side_effect = revoke
+        self.tick()
+        state = self.client.get(self.url).json()
+        self.assertEqual((state["status"], state["cursor"]), ("interrupted", 1))
 
     def test_crash_and_takeover_do_not_repeat_provider_effect(self):
         self.ask().raise_for_status()

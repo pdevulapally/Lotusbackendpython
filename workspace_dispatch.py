@@ -366,6 +366,11 @@ class RunRedirected(Exception):
     """A committed user instruction superseded this worker step."""
 
 
+def admitted_conversation_model() -> Anthropic | None:
+    # No financial reservation or reconciliation exists for this mode.
+    return None
+
+
 class Dispatcher:
     def __init__(
         self,
@@ -374,7 +379,6 @@ class Dispatcher:
         sandboxes,
         model,
         *,
-        admitted_conversation_model=None,
         workspace_clients=None,
     ):
         self.app = app
@@ -383,8 +387,6 @@ class Dispatcher:
         self.config = config
         self.sandboxes = sandboxes
         self.model = model
-        # The service entry point does not supply a client until durable spend admission exists.
-        self.conversation_model = admitted_conversation_model
         self.workspace_clients = workspace_clients
 
     def tick(self):
@@ -422,13 +424,16 @@ class Dispatcher:
         ):
             current = tx.get(path)
             writer = tx.get(slot)
+            if job.get("mode") == "conversation" and (
+                not current or current["claim"] != claim or current["available"] <= time.time()
+            ):
+                raise RunRedirected()
             if (
                 not current
                 or current["claim"] != claim
                 or not writer
                 or writer["active"] != key
                 or writer["generation"] != job["generation"]
-                or (job.get("mode") == "conversation" and current["available"] <= time.time())
             ):
                 raise RuntimeError("Run claim superseded.")
             conversational = current.get("mode") == "conversation"
@@ -494,6 +499,9 @@ class Dispatcher:
                 self.settings.project_run_permission,
                 "update",
                 apply,
+                also_require=(self.settings.project_session_write_permission,)
+                if job.get("mode") == "conversation"
+                else (),
             )
             if redirected:
                 raise RunRedirected()
@@ -529,7 +537,8 @@ class Dispatcher:
                     raise ValueError("Invalid conversation phase.")
                 if len(job["usage"]) >= self.config.max_steps:
                     raise ValueError("Conversation step limit reached.")
-                if self.conversation_model is None:
+                conversation_model = admitted_conversation_model()
+                if conversation_model is None:
                     checked(
                         {"status": "blocked_budget", "claim": None}, event=("blocked_budget", None)
                     )
@@ -537,7 +546,7 @@ class Dispatcher:
                 checked({"phase": "thinking"})
                 try:
                     reply, usage = respond(
-                        self.conversation_model,
+                        conversation_model,
                         self.settings.model_plans[job["plan"]],
                         job["events"],
                     )

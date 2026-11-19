@@ -62,6 +62,8 @@ def change_run(
         job = owned_run(tx.get(path), project)
         messages = job.get("messages", [])
         if message_id is not None:
+            if job.get("mode") == "conversation":
+                access.require_update(tx, project, settings.project_session_write_permission)
             for message in messages:
                 if message["id"] == message_id.hex:
                     if message["text"] != question or message.get("reply_to") != reply_to:

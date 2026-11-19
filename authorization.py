@@ -278,6 +278,10 @@ class AuthorizationService:
 
         return self._run(operation)
 
+    def require_update(self, tx: FirestoreSession, resource: ResourceRecord, permission: str):
+        """Check a child operation selected from state inside the owner's transaction."""
+        self._check_action(resource, self._policy(tx, resource.kind), permission, "update")
+
     def read_owned(self, kind: str, resource_id: str, permission: str) -> dict:
         return self.with_owned_resource(
             kind, resource_id, permission, "read", lambda tx, resource: resource.data

@@ -2,6 +2,17 @@
 
 ## Milestone 1 · 19 November 2026 (development only)
 
+PR revision: removed the conversational provider constructor option. Spend admission
+unconditionally returns no client; **only unit tests** replace that decision with a mock.
+Dispatcher publication and message retries check the current session-write permission;
+an expired conversational claim cannot publish even before another worker takes over.
+Added deterministic contention, acknowledgement-loss, expiry, timeout and revocation cases.
+`uv run --no-sync python -m scripts.check` passed locally: 117 tests, Ruff format/lint,
+Pyright, dependency compatibility and lock checks. Contention and financial outcomes are
+simulations, not staging evidence or a working ledger. No staging or production changes.
+The revised frontend removes the separate conversation page, keeps the existing chat on
+TypeScript, and uses the shared read layer without migrating customer traffic.
+
 The conversation mode uses the existing authorization transactions, scheduler and fenced
 run records. A version-specific ready status excludes legacy workspace-only workers.
 The default dispatcher has no admitted conversational responder: it records `blocked_budget`
