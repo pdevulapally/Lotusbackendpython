@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from hashlib import sha256
 from typing import Annotated, Literal, TypeVar
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from fastapi import Depends, HTTPException, Request
 from google.api_core.exceptions import (
@@ -81,10 +81,17 @@ class AuthorizationService:
                 422, "Choose a future expiry time with a timezone, or explicitly no expiry."
             )
 
-    def _run(self, operation: Callable[[FirestoreSession], Result]) -> Result:
+    def _run(
+        self,
+        operation: Callable[[FirestoreSession], Result],
+        *,
+        reconcile: Callable[[FirestoreSession], Result] | None = None,
+    ) -> Result:
         try:
             return self.store.run(operation)
         except Aborted, AlreadyExists, FailedPrecondition:
+            if reconcile is not None:
+                return self._run(reconcile)
             raise HTTPException(
                 409, "The resource changed during your request. Please refresh and try again."
             ) from None
@@ -258,12 +265,15 @@ class AuthorizationService:
         permission: str,
         action: Literal["read", "update"],
         callback: Callable[[FirestoreSession, ResourceRecord], Result],
+        *,
+        also_require: tuple[str, ...] = (),
     ) -> Result:
         uid = self._signed_in()
 
         def operation(tx: FirestoreSession):
             resource, policy = self._owner(tx, kind, resource_id, uid)
-            self._check_action(resource, policy, permission, action)
+            for required in (permission, *also_require):
+                self._check_action(resource, policy, required, action)
             return callback(tx, resource)
 
         return self._run(operation)
@@ -556,11 +566,27 @@ class AuthorizationService:
 
         self._run(operation)
 
-    def create_private(self, kind: str, permission: str, data: dict, *, team_id: str | None) -> str:
+    def create_private(
+        self,
+        kind: str,
+        permission: str,
+        data: dict,
+        *,
+        team_id: str | None,
+        operation_id: UUID | None = None,
+    ) -> str:
         uid = self._signed_in()
         resource_id = uuid4().hex
+        scope = json.dumps([uid, kind, permission, team_id, str(operation_id)]).encode()
+        receipt_path = (
+            self.collections.policies,
+            self.policy_id,
+            "creations",
+            sha256(scope).hexdigest(),
+        )
+        fingerprint = sha256(json.dumps(data, sort_keys=True, allow_nan=False).encode()).hexdigest()
 
-        def operation(tx: FirestoreSession):
+        def operation(tx: FirestoreSession, *, lookup_only=False):
             policy = self._policy(tx, kind)
             if permission not in policy.create_permissions:
                 raise denied()
@@ -573,6 +599,15 @@ class AuthorizationService:
                 member = self._member(tx, team_id, uid)
                 if member is None or permission not in member.permissions:
                     raise denied()
+            if operation_id and (prior := tx.get(receipt_path)) is not None:
+                existing = self._resource(tx, kind, prior["id"], None)
+                if existing.owner_uid != uid or existing.access_epoch != prior["epoch"]:
+                    raise denied()
+                if prior["payload"] != fingerprint:
+                    raise HTTPException(409, "This operation already has different content.")
+                return prior["id"]
+            if lookup_only:
+                raise HTTPException(409, "The project changed. Retry this operation.")
             resource = record(
                 ResourceRecord,
                 {
@@ -587,9 +622,18 @@ class AuthorizationService:
                 },
             )
             tx.put(self._path(resource_id), resource.model_dump(mode="json"), exists=False)
+            if operation_id:
+                tx.put(
+                    receipt_path,
+                    {"id": resource_id, "payload": fingerprint, "epoch": resource.access_epoch},
+                    exists=False,
+                )
+            return resource_id
 
-        self._run(operation)
-        return resource_id
+        return self._run(
+            operation,
+            reconcile=(lambda tx: operation(tx, lookup_only=True)) if operation_id else None,
+        )
 
 
 def get_authorization(request: Request, user: CurrentUser) -> AuthorizationService:

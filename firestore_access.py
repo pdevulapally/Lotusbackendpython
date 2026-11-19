@@ -9,6 +9,7 @@ from google.cloud.firestore_v1 import _helpers
 from google.cloud.firestore_v1.services.firestore import FirestoreClient
 from google.cloud.firestore_v1.types import Cursor, Document, StructuredQuery, Write
 
+from conversation import READY
 from observability import logger
 
 Result = TypeVar("Result")
@@ -117,8 +118,15 @@ class FirestoreSession:
                         {
                             "field_filter": {
                                 "field": {"field_path": "status"},
-                                "op": "EQUAL",
-                                "value": {"string_value": "queued"},
+                                "op": "IN",
+                                "value": {
+                                    "array_value": {
+                                        "values": [
+                                            {"string_value": "queued"},
+                                            {"string_value": READY},
+                                        ]
+                                    }
+                                },
                             }
                         },
                         {

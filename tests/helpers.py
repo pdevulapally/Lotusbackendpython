@@ -93,6 +93,27 @@ def make_settings(**changes) -> Settings:
 
 
 class ServiceTestCase(unittest.TestCase):
+    def install_policy(self, settings, store):
+        store.change(
+            (settings.authorization_collections.policies, settings.authorization_policy_id),
+            {
+                "resources": {
+                    settings.project_resource_kind: {
+                        "create_permissions": [settings.project_create_permission],
+                        "read_permissions": [settings.project_read_permission],
+                        "update_permissions": [
+                            settings.project_session_write_permission,
+                            settings.project_run_permission,
+                        ],
+                        "delete_permissions": [],
+                        "shareable_permissions": [],
+                        "link_read_permissions": [],
+                        "public_read_permissions": [],
+                    }
+                }
+            },
+        )
+
     def setUp(self):
         self.server = fakeredis.FakeServer()
         self.settings = make_settings()
@@ -106,7 +127,7 @@ class ServiceTestCase(unittest.TestCase):
 
         def verified_user(request: Request):
             self.verified_calls.append(True)
-            return {"uid": request.headers.get("X-Test-Verified-User", "alice")}
+            return {"uid": request.headers.get("X-Test-Verified-User", "alice"), "auth_time": 1}
 
         if verified:
             app.dependency_overrides[get_current_user] = verified_user

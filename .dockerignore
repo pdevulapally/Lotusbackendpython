@@ -18,6 +18,7 @@
 !request_limits.py
 !serve.py
 !workspace_runs.py
+!conversation.py
 !workspace_dispatch.py
 !sandbox_worker.py
 !deploy/Daytona.Dockerfile

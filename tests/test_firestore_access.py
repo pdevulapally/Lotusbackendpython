@@ -94,6 +94,24 @@ class FirestoreAccessTests(unittest.TestCase):
             self.store.run(lambda session: session.put(("records", "id"), {}, exists=False))
         self.client.commit.assert_not_called()
 
+    def test_due_query_includes_only_workspace_and_conversation_ready_jobs(self):
+        self.client.run_query.return_value = []
+        self.assertIsNone(self.store.run(lambda tx: tx.next_queued_run("jobs")))
+        request = self.client.run_query.call_args.kwargs["request"]
+        query = request["structured_query"]
+        status, due = (item.field_filter for item in query.where.composite_filter.filters)
+        self.assertEqual(status.op.name, "IN")
+        self.assertEqual(
+            [v.string_value for v in status.value.array_value.values],
+            [
+                "queued",
+                "conversation_ready",
+            ],
+        )
+        self.assertEqual(request["transaction"], b"test-tx")
+        self.assertEqual(due.field.field_path, "available")
+        self.assertEqual(query.limit, 1)
+
     def test_wrong_returned_document_identity_is_rejected(self):
         self.client.batch_get_documents.return_value = [
             BatchGetDocumentsResponse(found=Document(name="wrong"))

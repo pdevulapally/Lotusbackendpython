@@ -18,6 +18,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from authorization import AuthorizationService
 from billing import effective_plan
 from config import NonEmpty
+from conversation import READY, EventKind, append_event, respond
 from main import create_app
 from observability import logger
 from project_sessions import validated_question
@@ -27,6 +28,10 @@ from workspace_runs import slot_path
 
 class WorkerSettings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="WORKER_", hide_input_in_errors=True)
+    poll_seconds: PositiveFloat
+    lease_seconds: PositiveInt
+    context_max_bytes: PositiveInt
+    max_steps: PositiveInt
     daytona_api_key: SecretStr
     daytona_api_url: NonEmpty
     daytona_target: NonEmpty
@@ -36,13 +41,9 @@ class WorkerSettings(BaseSettings):
     state_dir: str
     script: str
     anthropic_api_key: SecretStr
-    poll_seconds: PositiveFloat
     operation_seconds: PositiveInt
-    lease_seconds: PositiveInt
     idle_minutes: PositiveInt
-    max_steps: PositiveInt
     file_max_bytes: PositiveInt
-    context_max_bytes: PositiveInt
 
     @model_validator(mode="after")
     def bounds(self):
@@ -366,13 +367,25 @@ class RunRedirected(Exception):
 
 
 class Dispatcher:
-    def __init__(self, app, config, sandboxes, model):
+    def __init__(
+        self,
+        app,
+        config,
+        sandboxes,
+        model,
+        *,
+        admitted_conversation_model=None,
+        workspace_clients=None,
+    ):
         self.app = app
         self.settings = app.state.settings
         self.store = app.state.resource_database
         self.config = config
         self.sandboxes = sandboxes
         self.model = model
+        # The service entry point does not supply a client until durable spend admission exists.
+        self.conversation_model = admitted_conversation_model
+        self.workspace_clients = workspace_clients
 
     def tick(self):
         claim = uuid4().hex
@@ -399,7 +412,14 @@ class Dispatcher:
         slot = slot_path(self.settings, job["project"])
         access = AuthorizationService(self.store, self.settings, job["uid"])
 
-        def transition(tx, changes, *, sandbox_id=None, control=False):
+        def transition(
+            tx,
+            changes,
+            *,
+            sandbox_id=None,
+            control=False,
+            event: tuple[EventKind, str | None] | None = None,
+        ):
             current = tx.get(path)
             writer = tx.get(slot)
             if (
@@ -408,13 +428,35 @@ class Dispatcher:
                 or not writer
                 or writer["active"] != key
                 or writer["generation"] != job["generation"]
+                or (job.get("mode") == "conversation" and current["available"] <= time.time())
             ):
                 raise RuntimeError("Run claim superseded.")
-            redirect = user_redirect(current, changes) if control else None
+            conversational = current.get("mode") == "conversation"
+            redirect = None
+            if control and conversational and changes.get("status") != "uncertain":
+                if current.get("stop_requested"):
+                    redirect = {"status": "stopped", "claim": None}
+                    event = ("stopped", None)
+                elif len(current.get("messages", [])) != len(job.get("messages", [])):
+                    redirect = {
+                        "status": READY,
+                        "phase": "decide",
+                        "claim": None,
+                        "available": time.time(),
+                    }
+                    event = None
+                if redirect is not None and "usage" in changes:
+                    redirect["usage"] = changes["usage"]
+            elif control and not conversational:
+                redirect = user_redirect(current, changes)
             if redirect is not None:
                 changes = redirect
             settled_write = current["pending_write"] and changes.get("pending_write") is False
             current.update(changes)
+            if event:
+                append_event(current, event[0], event[1])
+                if len(json.dumps(current).encode()) > self.config.context_max_bytes:
+                    raise ValueError("Conversation context limit reached.")
             if settled_write:
                 current.pop("receipt_attempts", None)
                 if (
@@ -426,13 +468,16 @@ class Dispatcher:
                 if writer["sandbox"] not in (None, sandbox_id):
                     raise RuntimeError("Sandbox changed.")
                 writer["sandbox"] = sandbox_id
-            if current["status"] != "queued" and not current["pending_write"]:
+            if (
+                current["status"] not in {"queued", READY, "clarification"}
+                and not current["pending_write"]
+            ):
                 writer["active"] = None
             tx.put(path, current, exists=True)
             tx.put(slot, writer, exists=True)
             return writer["sandbox"], redirect is not None
 
-        def checked(changes, *, sandbox_id=None):
+        def checked(changes, *, sandbox_id=None, event=None):
             def apply(tx, project):
                 if (
                     project.access_epoch != job["epoch"]
@@ -441,7 +486,7 @@ class Dispatcher:
                     or self.settings.model_plans[job["plan"]].model_id != job["model"]
                 ):
                     raise HTTPException(403, "Run access changed.")
-                return transition(tx, changes, sandbox_id=sandbox_id, control=True)
+                return transition(tx, changes, sandbox_id=sandbox_id, control=True, event=event)
 
             bound, redirected = access.with_owned_resource(
                 self.settings.project_resource_kind,
@@ -458,6 +503,9 @@ class Dispatcher:
             validated_question(job["question"], self.settings.session_question_max_bytes)
             for message in job.get("messages", []):
                 validated_question(message["text"], self.settings.session_question_max_bytes)
+            if job.get("mode") == "conversation" and job["phase"] == "thinking":
+                checked({"status": "uncertain", "claim": None}, event=("uncertain", None))
+                return True
             bound = checked({})
             if job["phase"] == "thinking":
                 raise ValueError("Model request was interrupted.")
@@ -466,8 +514,51 @@ class Dispatcher:
                 and time.time() >= job["submitted"] + self.settings.ai_run_timeout_seconds
             ):
                 raise ValueError("Run expired.")
-            if auth.get_user(job["uid"], app=self.app.state.firebase_app).disabled:
-                raise HTTPException(403, "Account disabled.")
+
+            def check_identity():
+                account = auth.get_user(job["uid"], app=self.app.state.firebase_app)
+                if account.disabled or (
+                    job.get("mode") == "conversation"
+                    and job["auth_time"] * 1000 < account.tokens_valid_after_timestamp
+                ):
+                    raise HTTPException(403, "Account access changed.")
+
+            check_identity()
+            if job.get("mode") == "conversation":
+                if job["phase"] != "decide":
+                    raise ValueError("Invalid conversation phase.")
+                if len(job["usage"]) >= self.config.max_steps:
+                    raise ValueError("Conversation step limit reached.")
+                if self.conversation_model is None:
+                    checked(
+                        {"status": "blocked_budget", "claim": None}, event=("blocked_budget", None)
+                    )
+                    return True
+                checked({"phase": "thinking"})
+                try:
+                    reply, usage = respond(
+                        self.conversation_model,
+                        self.settings.model_plans[job["plan"]],
+                        job["events"],
+                    )
+                    text = validated_question(reply.text, self.settings.ai_answer_max_bytes)
+                except Exception:
+                    checked({"status": "uncertain", "claim": None}, event=("uncertain", None))
+                    return True
+                status = "completed" if reply.kind == "answer" else "clarification"
+                check_identity()
+                checked(
+                    {
+                        "status": status,
+                        "phase": "decide",
+                        "claim": None,
+                        "usage": [*job["usage"], usage],
+                    },
+                    event=(reply.kind, text),
+                )
+                return True
+            if self.workspace_clients and self.sandboxes is None:
+                self.sandboxes, self.model = self.workspace_clients()
             command_id = uuid5(NAMESPACE_URL, f"{key}/{job['step']}").hex
             if job["phase"] == "recover":
                 if not bound or job["action"]["action"] != "write" or not job["pending_write"]:
@@ -573,12 +664,20 @@ async def main():
     app = create_app()
     config = WorkerSettings.model_validate({})
     async with app.router.lifespan_context(app):
-        with Anthropic(
-            api_key=config.anthropic_api_key.get_secret_value(),
-            max_retries=0,
-            timeout=config.operation_seconds,
-        ) as model:
-            dispatcher = Dispatcher(app, config, SandboxTools(config), model)
+        with contextlib.ExitStack() as clients:
+
+            def workspace_clients():
+                sandboxes = SandboxTools(config)
+                model = clients.enter_context(
+                    Anthropic(
+                        api_key=config.anthropic_api_key.get_secret_value(),
+                        max_retries=0,
+                        timeout=config.operation_seconds,
+                    )
+                )
+                return sandboxes, model
+
+            dispatcher = Dispatcher(app, config, None, None, workspace_clients=workspace_clients)
             while True:
                 try:
                     if await asyncio.to_thread(dispatcher.tick):

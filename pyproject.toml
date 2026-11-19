@@ -37,6 +37,7 @@ include = [
     "authorization.py",
     "authorization_models.py",
     "config.py",
+    "conversation.py",
     "database.py",
     "firestore_access.py",
     "health.py",

@@ -14,7 +14,7 @@ RUN groupadd --system api && useradd --system --gid api --home-dir /app api
 WORKDIR /app
 COPY --from=dependencies /app/.venv /app/.venv
 COPY auth.py authorization.py authorization_models.py billing.py config.py database.py firestore_access.py health.py main.py observability.py project_sessions.py projects.py rate_limits.py request_limits.py serve.py ./
-COPY workspace_runs.py workspace_dispatch.py sandbox_worker.py ./
+COPY conversation.py workspace_runs.py workspace_dispatch.py sandbox_worker.py ./
 ENV PATH="/app/.venv/bin:$PATH" \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1

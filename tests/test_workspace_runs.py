@@ -28,27 +28,6 @@ from workspace_runs import run_key, slot_path
 
 
 class WorkerTests(ServiceTestCase):
-    def install_policy(self, settings, store):
-        store.change(
-            (settings.authorization_collections.policies, settings.authorization_policy_id),
-            {
-                "resources": {
-                    settings.project_resource_kind: {
-                        "create_permissions": [settings.project_create_permission],
-                        "read_permissions": [settings.project_read_permission],
-                        "update_permissions": [
-                            settings.project_session_write_permission,
-                            settings.project_run_permission,
-                        ],
-                        "delete_permissions": [],
-                        "shareable_permissions": [],
-                        "link_read_permissions": [],
-                        "public_read_permissions": [],
-                    }
-                }
-            },
-        )
-
     def test_pre_start_correction_preserves_the_new_run_baseline(self):
         job = {
             "messages": [{"text": "Change the title"}],

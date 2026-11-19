@@ -1,5 +1,27 @@
 # LotusBuild FastAPI backend handoff
 
+## Milestone 1 · 19 November 2026 (development only)
+
+The conversation mode uses the existing authorization transactions, scheduler and fenced
+run records. A version-specific ready status excludes legacy workspace-only workers.
+The default dispatcher has no admitted conversational responder: it records `blocked_budget`
+rather than starting Daytona or spending money. Project creation accepts a scoped operation ID.
+The workspace path, Stripe, and existing financial ownership remain in place. No staging or
+provider calls; release remains blocked on budget admission, isolated staging and rollback.
+`uv run --no-sync python -m scripts.check` passed locally on Linux: format, lint, Pyright,
+111 unit/contract tests, installed dependencies and lockfile. Coverage includes a racing
+create transaction, clarification replay, Stop/correction during model execution, claim
+takeover, revocation, the Firestore query encoding and no workspace calls for conversations.
+Provider results, identity, Redis and Firestore in these tests are local fixtures. The
+existing file-backed recovery suite still passes. The separate opt-in frontend passed
+typecheck, 361 contracts and its build. No new dependencies or credentials.
+
+Next: test a same-origin `/api/v1/projects` route to this Python service on isolated staging
+while existing endpoints stay on TypeScript. Verify both accounts, query indexes, revocation,
+lease takeover, lost acknowledgements, private-data retention and mixed-version rollback.
+Keep paid conversational execution disabled until the authoritative payer has atomic
+reservation, settlement and reconciliation; a model key is not spend authorization.
+
 ## Current checkpoint · 17 November 2026
 
 **Pending-write reconciliation.** Writes are reserved in receipt-only recovery

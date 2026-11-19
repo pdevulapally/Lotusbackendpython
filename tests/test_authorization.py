@@ -34,7 +34,7 @@ class MemorySession:
             for path, doc in self.documents.items()
             if len(path) == 2
             and path[0] == collection
-            and doc.get("status") == "queued"
+            and doc.get("status") in {"queued", "conversation_ready"}
             and doc["available"] <= time.time()
         ]
         return min(rows, key=lambda row: row[1]["available"]) if rows else None
